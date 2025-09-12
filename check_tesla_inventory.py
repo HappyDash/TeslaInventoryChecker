@@ -2,6 +2,8 @@
 check_tesla_inventory.py
 
 - Scrapes Tesla Model Y inventory near ZIP 95054.
+- Waits 5 seconds after loading the page.
+- Closes the modal if it appears.
 - Sends email listing all new cars found.
 - Uses Playwright to scrape the page directly.
 """
@@ -66,6 +68,18 @@ def scrape_inventory():
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(TESLA_URL)
+
+        # Wait 5 seconds for page to load
+        page.wait_for_timeout(5000)  # Playwright-native wait
+
+        # Close modal if it appears
+        try:
+            modal_close = page.query_selector(".tds-modal-close")
+            if modal_close:
+                modal_close.click()
+                print("Modal closed")
+        except Exception:
+            print("No modal found")
 
         # wait for inventory to load
         page.wait_for_selector("article.result.card", timeout=30000)
