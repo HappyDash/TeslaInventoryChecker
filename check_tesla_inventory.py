@@ -1,10 +1,11 @@
 """
 check_tesla_inventory.py
 
-- Checks Tesla inventory for Model Y around ZIP 95054.
-- Uses API first; falls back to Playwright scraping if API fails.
-- Sends email alert when a new Model Y is found.
-- Keeps last seen listings in last_seen.json to avoid duplicate emails.
+- Checks Tesla Model Y inventory around ZIP 95054.
+- Uses API first; falls back to Playwright scraping.
+- Robust against page changes and avoids timeout errors.
+- Sends email alert for new listings.
+- Keeps last_seen.json to avoid duplicate emails.
 """
 
 import os
@@ -13,8 +14,6 @@ from pathlib import Path
 import requests
 import smtplib
 from email.mime.text import MIMEText
-
-# Playwright import
 from playwright.sync_api import sync_playwright
 
 # ------------------------
@@ -63,7 +62,7 @@ def send_email(subject, body):
 
 
 # ------------------------
-# Tesla inventory API
+# Tesla Inventory API
 # ------------------------
 def query_tesla_inventory_api(zip_code, distance):
     try:
@@ -95,7 +94,7 @@ def query_tesla_inventory_api(zip_code, distance):
         return parsed
     except Exception as e:
         print("[API] Failed:", e)
-        return None  # None signals fallback to Playwright
+        return None  # signal to fallback to Playwright
 
 
 # ------------------------
@@ -109,29 +108,37 @@ def query_tesla_inventory_playwright(zip_code, distance):
         page = browser.new_page()
         url = f"https://www.tesla.com/inventory/new/m?zip={zip_code}&distance={distance}&model=MY"
         page.goto(url)
-        # Wait for listings to load
-        page.wait_for_selector("div.result-item, .inventory-listing", timeout=30000)
-        items = page.query_selector_all("div.result-item, .inventory-listing")
-        for item in items:
-            text = item.inner_text()
+
+        # Wait for main container or fallback
+        try:
+            page.wait_for_selector("div#inventory-list-container", timeout=15000)
+            page.wait_for_timeout(3000)  # extra wait for JS
+            items = page.query_selector_all("div#inventory-list-container > div")
+            for item in items:
+                text = item.inner_text()
+                if "Model Y" in text:
+                    results.append({"id": hash(text), "text": text[:300]})
+            print(f"[Playwright] Found {len(results)} vehicles via container.")
+        except Exception:
+            print("[Playwright] Main container not found, fallback to full page text")
+            text = page.inner_text("body")
             if "Model Y" in text:
-                results.append({
-                    "id": hash(text),  # fallback unique ID
-                    "text": text[:300]
-                })
+                results.append({"id": hash(text), "text": text[:500]})
+            print(f"[Playwright] Found {len(results)} vehicles via full-page text fallback.")
+
         browser.close()
-    print(f"[Playwright] Found {len(results)} vehicles via scraping.")
     return results
 
 
 # ------------------------
-# Main
+# Main flow
 # ------------------------
 def main():
     last_seen = load_last_seen()
     listings = query_tesla_inventory_api(ZIP, SEARCH_DISTANCE)
     if listings is None or len(listings) == 0:
         listings = query_tesla_inventory_playwright(ZIP, SEARCH_DISTANCE)
+
     if not listings:
         print("No listings found.")
         return
