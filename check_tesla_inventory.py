@@ -2,77 +2,74 @@
 check_tesla_inventory.py
 
 - Checks Tesla inventory for Model Y around ZIP 95054.
-- Sends an email notification when a new Model Y listing appears.
-- Keeps a small file `seen_ids.txt` to avoid duplicate notifications.
+- Uses API first; falls back to Playwright scraping if API fails.
+- Sends email alert when a new Model Y is found.
+- Keeps last seen listings in last_seen.json to avoid duplicate emails.
 """
 
 import os
 import json
 from pathlib import Path
-from typing import List, Dict
-
 import requests
 import smtplib
 from email.mime.text import MIMEText
 
-# CONFIG
-ZIP = os.getenv("TARGET_ZIP", "95054")
-SEARCH_DISTANCE = int(os.getenv("SEARCH_DISTANCE", "50"))  # miles
-SEEN_FILE = Path("seen_ids.txt")
+# Playwright import
+from playwright.sync_api import sync_playwright
 
-# Email config from GitHub Secrets / environment variables
-SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER")
-SMTP_PASS = os.getenv("SMTP_PASS")
-EMAIL_TO = os.getenv("EMAIL_TO")
-EMAIL_FROM = os.getenv("EMAIL_FROM", SMTP_USER)
+# ------------------------
+# Config
+# ------------------------
+ZIP = os.getenv("TARGET_ZIP", "95054")
+SEARCH_DISTANCE = int(os.getenv("SEARCH_DISTANCE", "50"))
+LAST_SEEN_FILE = Path("last_seen.json")
+
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
+TO_EMAIL = os.getenv("TO_EMAIL")
+EMAIL_FROM = os.getenv("EMAIL_FROM", EMAIL_ADDRESS)
 
 
 # ------------------------
 # Helpers
 # ------------------------
-def load_seen_ids() -> set:
-    if SEEN_FILE.exists():
-        return set(l.strip() for l in SEEN_FILE.read_text().splitlines() if l.strip())
+def load_last_seen():
+    if LAST_SEEN_FILE.exists():
+        return set(json.load(LAST_SEEN_FILE))
     return set()
 
 
-def save_seen_ids(ids: set):
-    SEEN_FILE.write_text("\n".join(sorted(ids)))
+def save_last_seen(ids):
+    with open(LAST_SEEN_FILE, "w") as f:
+        json.dump(list(ids), f)
 
 
-def send_email(subject: str, body: str):
-    if not (SMTP_USER and SMTP_PASS and EMAIL_TO):
-        print("[WARN] Email credentials not set; skipping email. Message would be:\n", body)
+def send_email(subject, body):
+    if not (EMAIL_ADDRESS and EMAIL_PASSWORD and TO_EMAIL):
+        print("[WARN] Email credentials missing. Would send:\n", body)
         return
-
     msg = MIMEText(body)
     msg["Subject"] = subject
     msg["From"] = EMAIL_FROM
-    msg["To"] = EMAIL_TO
-
+    msg["To"] = TO_EMAIL
     try:
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
+            server.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             server.send_message(msg)
-        print("Email sent to", EMAIL_TO)
+        print("Email sent to", TO_EMAIL)
     except Exception as e:
         print("Failed to send email:", e)
 
 
 # ------------------------
-# Tesla inventory check
+# Tesla inventory API
 # ------------------------
-def query_tesla_inventory_api(zip_code: str, distance: int) -> List[Dict]:
-    """
-    Try to hit Tesla's public inventory endpoint.
-    """
+def query_tesla_inventory_api(zip_code, distance):
     try:
         payload = {
             "query": {
-                "model": "MY",       # Model Y
+                "model": "MY",
                 "condition": "new",
                 "zip": zip_code,
                 "range": distance
@@ -85,62 +82,83 @@ def query_tesla_inventory_api(zip_code: str, distance: int) -> List[Dict]:
         vehicles = data.get("results", [])
         parsed = []
         for v in vehicles:
-            vid = v.get("id") or v.get("vin") or json.dumps(v)[:50]
+            vid = v.get("id") or v.get("vin")
             parsed.append({
                 "id": vid,
                 "vin": v.get("vin"),
-                "model": v.get("model"),
                 "trim": v.get("trim"),
                 "price": v.get("price"),
-                "miles": v.get("miles"),
                 "city": v.get("city"),
-                "state": v.get("state"),
-                "stock": v.get("inventory_id") or v.get("id")
+                "state": v.get("state")
             })
-        print(f"[api] Found {len(parsed)} vehicles via API.")
+        print(f"[API] Found {len(parsed)} vehicles via API.")
         return parsed
     except Exception as e:
-        print("[api] Inventory API failed:", e)
-        return []
-
-
-def find_new_listings():
-    return query_tesla_inventory_api(ZIP, SEARCH_DISTANCE)
+        print("[API] Failed:", e)
+        return None  # None signals fallback to Playwright
 
 
 # ------------------------
-# Main flow
+# Playwright fallback
+# ------------------------
+def query_tesla_inventory_playwright(zip_code, distance):
+    print("[Playwright] Scraping inventory page...")
+    results = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        url = f"https://www.tesla.com/inventory/new/m?zip={zip_code}&distance={distance}&model=MY"
+        page.goto(url)
+        # Wait for listings to load
+        page.wait_for_selector("div.result-item, .inventory-listing", timeout=30000)
+        items = page.query_selector_all("div.result-item, .inventory-listing")
+        for item in items:
+            text = item.inner_text()
+            if "Model Y" in text:
+                results.append({
+                    "id": hash(text),  # fallback unique ID
+                    "text": text[:300]
+                })
+        browser.close()
+    print(f"[Playwright] Found {len(results)} vehicles via scraping.")
+    return results
+
+
+# ------------------------
+# Main
 # ------------------------
 def main():
-    seen = load_seen_ids()
-    listings = find_new_listings()
+    last_seen = load_last_seen()
+    listings = query_tesla_inventory_api(ZIP, SEARCH_DISTANCE)
+    if listings is None or len(listings) == 0:
+        listings = query_tesla_inventory_playwright(ZIP, SEARCH_DISTANCE)
     if not listings:
         print("No listings found.")
         return
 
-    new_items = []
+    new_listings = []
     for l in listings:
-        lid = str(l.get("id") or l.get("vin") or l.get("stock"))
-        if lid not in seen:
-            new_items.append(lid)
-            seen.add(lid)
+        lid = str(l.get("id"))
+        if lid not in last_seen:
+            new_listings.append(lid)
+            last_seen.add(lid)
 
-    if new_items:
+    if new_listings:
         first = listings[0]
-        msg_lines = [
+        body = "\n".join([
             f"🚗 Tesla Model Y available near {ZIP}!",
-            f"Trim: {first.get('trim') or 'N/A'}",
+            f"Trim: {first.get('trim') or first.get('text','N/A')}",
             f"Price: {first.get('price') or 'N/A'}",
             f"VIN/ID: {first.get('vin') or first.get('id')}",
-            f"Location: {first.get('city')}, {first.get('state')}",
+            f"Location: {first.get('city','N/A')}, {first.get('state','N/A')}",
             f"Link: https://www.tesla.com/inventory/new/m?zip={ZIP}&model=MY"
-        ]
-        body = "\n".join(msg_lines)
-        print("New listings detected:", new_items)
+        ])
         send_email("Tesla Model Y Available", body)
-        save_seen_ids(seen)
+        print(f"New listings detected: {new_listings}")
     else:
         print("No new listings since last check.")
+
+    save_last_seen(last_seen)
 
 
 if __name__ == "__main__":
