@@ -28,6 +28,9 @@ EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 TO_EMAIL = os.getenv("TO_EMAIL")
 EMAIL_FROM = os.getenv("EMAIL_FROM", EMAIL_ADDRESS)
 
+# Tesla inventory URL
+TESLA_URL = f"https://www.tesla.com/inventory/new/my?arrangeby=savings&zip={ZIP}&range=0"
+
 
 # ------------------------
 # Helpers
@@ -64,17 +67,17 @@ def send_email(subject, body):
 # ------------------------
 # Tesla Inventory API
 # ------------------------
-def query_tesla_inventory_api(zip_code, distance):
+def query_tesla_inventory_api():
     try:
+        url = "https://www.tesla.com/inventory/api/v1/inventory-results"
         payload = {
             "query": {
                 "model": "MY",
                 "condition": "new",
-                "zip": zip_code,
-                "range": distance
+                "zip": ZIP,
+                "range": 50
             }
         }
-        url = "https://www.tesla.com/inventory/api/v1/inventory-results"
         r = requests.post(url, json=payload, timeout=15)
         r.raise_for_status()
         data = r.json()
@@ -94,33 +97,32 @@ def query_tesla_inventory_api(zip_code, distance):
         return parsed
     except Exception as e:
         print("[API] Failed:", e)
-        return None  # signal to fallback to Playwright
+        return None  # fallback to Playwright
 
 
 # ------------------------
 # Playwright fallback
 # ------------------------
-def query_tesla_inventory_playwright(zip_code, distance):
+def query_tesla_inventory_playwright():
     print("[Playwright] Scraping inventory page...")
     results = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
-        url = f"https://www.tesla.com/inventory/new/m?zip={zip_code}&distance={distance}&model=MY"
-        page.goto(url)
+        page.goto(TESLA_URL)
 
-        # Wait for main container or fallback
+        # Wait for main container
         try:
-            page.wait_for_selector("div#inventory-list-container", timeout=15000)
+            page.wait_for_selector("div.tds-card__content", timeout=20000)
             page.wait_for_timeout(3000)  # extra wait for JS
-            items = page.query_selector_all("div#inventory-list-container > div")
+            items = page.query_selector_all("div.tds-card__content")
             for item in items:
                 text = item.inner_text()
                 if "Model Y" in text:
                     results.append({"id": hash(text), "text": text[:300]})
             print(f"[Playwright] Found {len(results)} vehicles via container.")
         except Exception:
-            print("[Playwright] Main container not found, fallback to full page text")
+            print("[Playwright] Container not found, fallback to full page text")
             text = page.inner_text("body")
             if "Model Y" in text:
                 results.append({"id": hash(text), "text": text[:500]})
@@ -135,9 +137,9 @@ def query_tesla_inventory_playwright(zip_code, distance):
 # ------------------------
 def main():
     last_seen = load_last_seen()
-    listings = query_tesla_inventory_api(ZIP, SEARCH_DISTANCE)
+    listings = query_tesla_inventory_api()
     if listings is None or len(listings) == 0:
-        listings = query_tesla_inventory_playwright(ZIP, SEARCH_DISTANCE)
+        listings = query_tesla_inventory_playwright()
 
     if not listings:
         print("No listings found.")
@@ -158,7 +160,7 @@ def main():
             f"Price: {first.get('price') or 'N/A'}",
             f"VIN/ID: {first.get('vin') or first.get('id')}",
             f"Location: {first.get('city','N/A')}, {first.get('state','N/A')}",
-            f"Link: https://www.tesla.com/inventory/new/m?zip={ZIP}&model=MY"
+            f"Link: {TESLA_URL}"
         ])
         send_email("Tesla Model Y Available", body)
         print(f"New listings detected: {new_listings}")
