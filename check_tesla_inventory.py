@@ -1,36 +1,29 @@
 """
 check_tesla_inventory.py
 
-- Checks Tesla Model Y inventory around ZIP 95054.
-- Uses API first; falls back to Playwright scraping.
-- Robust against page changes and avoids timeout errors.
-- Sends email alert for new listings.
-- Keeps last_seen.json to avoid duplicate emails.
+- Scrapes Tesla Model Y inventory near ZIP 95054.
+- Sends email listing all new cars found.
+- Uses Playwright to scrape the page directly.
 """
 
 import os
 import json
 from pathlib import Path
-import requests
+from playwright.sync_api import sync_playwright
 import smtplib
 from email.mime.text import MIMEText
-from playwright.sync_api import sync_playwright
 
 # ------------------------
 # Config
 # ------------------------
-ZIP = os.getenv("TARGET_ZIP", "95054")
-SEARCH_DISTANCE = int(os.getenv("SEARCH_DISTANCE", "50"))
+ZIP = "95054"
+TESLA_URL = f"https://www.tesla.com/inventory/new/my?arrangeby=savings&zip={ZIP}&range=0"
 LAST_SEEN_FILE = Path("last_seen.json")
 
 EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 TO_EMAIL = os.getenv("TO_EMAIL")
 EMAIL_FROM = os.getenv("EMAIL_FROM", EMAIL_ADDRESS)
-
-# Tesla inventory URL
-TESLA_URL = f"https://www.tesla.com/inventory/new/my?arrangeby=savings&zip={ZIP}&range=0"
-
 
 # ------------------------
 # Helpers
@@ -65,81 +58,42 @@ def send_email(subject, body):
 
 
 # ------------------------
-# Tesla Inventory API
+# Scrape Tesla Inventory
 # ------------------------
-def query_tesla_inventory_api():
-    try:
-        url = "https://www.tesla.com/inventory/api/v1/inventory-results"
-        payload = {
-            "query": {
-                "model": "MY",
-                "condition": "new",
-                "zip": ZIP,
-                "range": 50
-            }
-        }
-        r = requests.post(url, json=payload, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        vehicles = data.get("results", [])
-        parsed = []
-        for v in vehicles:
-            vid = v.get("id") or v.get("vin")
-            parsed.append({
-                "id": vid,
-                "vin": v.get("vin"),
-                "trim": v.get("trim"),
-                "price": v.get("price"),
-                "city": v.get("city"),
-                "state": v.get("state")
-            })
-        print(f"[API] Found {len(parsed)} vehicles via API.")
-        return parsed
-    except Exception as e:
-        print("[API] Failed:", e)
-        return None  # fallback to Playwright
-
-
-# ------------------------
-# Playwright fallback
-# ------------------------
-def query_tesla_inventory_playwright():
-    print("[Playwright] Scraping inventory page...")
-    results = []
+def scrape_inventory():
+    listings = []
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page()
         page.goto(TESLA_URL)
 
-        # Wait for main container
-        try:
-            page.wait_for_selector("div.tds-card__content", timeout=20000)
-            page.wait_for_timeout(3000)  # extra wait for JS
-            items = page.query_selector_all("div.tds-card__content")
-            for item in items:
-                text = item.inner_text()
-                if "Model Y" in text:
-                    results.append({"id": hash(text), "text": text[:300]})
-            print(f"[Playwright] Found {len(results)} vehicles via container.")
-        except Exception:
-            print("[Playwright] Container not found, fallback to full page text")
-            text = page.inner_text("body")
-            if "Model Y" in text:
-                results.append({"id": hash(text), "text": text[:500]})
-            print(f"[Playwright] Found {len(results)} vehicles via full-page text fallback.")
+        # wait for inventory to load
+        page.wait_for_selector("article.result.card", timeout=30000)
+
+        items = page.query_selector_all("article.result.card")
+        for item in items:
+            try:
+                trim = item.query_selector(".trim-name").inner_text().strip()
+                price = item.query_selector(".card-info-tooltip-container span").inner_text().strip()
+                vin = item.get_attribute("data-id")
+                listings.append({
+                    "id": vin,
+                    "trim": trim,
+                    "price": price
+                })
+            except Exception:
+                continue
 
         browser.close()
-    return results
+    return listings
 
 
 # ------------------------
-# Main flow
+# Main
 # ------------------------
 def main():
     last_seen = load_last_seen()
-    listings = query_tesla_inventory_api()
-    if listings is None or len(listings) == 0:
-        listings = query_tesla_inventory_playwright()
+    listings = scrape_inventory()
 
     if not listings:
         print("No listings found.")
@@ -147,23 +101,23 @@ def main():
 
     new_listings = []
     for l in listings:
-        lid = str(l.get("id"))
+        lid = l["id"]
         if lid not in last_seen:
-            new_listings.append(lid)
+            new_listings.append(l)
             last_seen.add(lid)
 
     if new_listings:
-        first = listings[0]
-        body = "\n".join([
-            f"🚗 Tesla Model Y available near {ZIP}!",
-            f"Trim: {first.get('trim') or first.get('text','N/A')}",
-            f"Price: {first.get('price') or 'N/A'}",
-            f"VIN/ID: {first.get('vin') or first.get('id')}",
-            f"Location: {first.get('city','N/A')}, {first.get('state','N/A')}",
-            f"Link: {TESLA_URL}"
-        ])
+        body_lines = [f"🚗 Tesla Model Y Available near {ZIP}!\n"]
+        for idx, car in enumerate(new_listings, 1):
+            body_lines.append(f"Car {idx}:")
+            body_lines.append(f"Trim: {car['trim']}")
+            body_lines.append(f"Price: {car['price']}")
+            body_lines.append(f"ID: {car['id']}")
+            body_lines.append(f"Link: {TESLA_URL}")
+            body_lines.append("-" * 40)
+        body = "\n".join(body_lines)
         send_email("Tesla Model Y Available", body)
-        print(f"New listings detected: {new_listings}")
+        print(f"New listings detected: {[l['id'] for l in new_listings]}")
     else:
         print("No new listings since last check.")
 
